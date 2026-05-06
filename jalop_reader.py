@@ -152,6 +152,48 @@ def verify_signature(metadata_root, metadata_ns, payload_bytes: bytes, public_ke
         return False, f"Signature verification failed: {exc}"
 
 
+def find_metadata_files(root: Path):
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("*_metadata.xml") if p.is_file()]
+
+
+def find_record_by_identifier(root: Path, identifier: str):
+    candidates = []
+    for metadata_path in find_metadata_files(root):
+        record_id = metadata_path.name[:-len("_metadata.xml")]
+        if record_id.startswith(identifier):
+            candidates.append(metadata_path)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise RuntimeError(
+            f"Multiple metadata files match prefix '{identifier}':\n" +
+            "\n".join(str(p) for p in sorted(candidates))
+        )
+
+    for metadata_path in find_metadata_files(root):
+        try:
+            _, metadata_root = parse_xml_file(metadata_path)
+        except RuntimeError:
+            continue
+        ns = build_ns(metadata_root)
+        jal_entry_id = find_text(metadata_root, ".//jal:JalEntryId", ns, default="")
+        if jal_entry_id == identifier:
+            return metadata_path
+    return None
+
+
+def determine_search_root():
+    cwd = Path.cwd()
+    if cwd.name == "jalop_records":
+        return cwd
+    jalop_root = cwd / "jalop_records"
+    if jalop_root.exists() and jalop_root.is_dir():
+        return jalop_root
+    return cwd
+
+
 def resolve_paths(first_arg: str, second_arg: str | None):
     p1 = Path(first_arg)
 
@@ -164,10 +206,18 @@ def resolve_paths(first_arg: str, second_arg: str | None):
         payload_guess = p1.with_name(p1.name.replace("_metadata.xml", "_payload.xml"))
         return p1, payload_guess
 
-    # Case 3: prefix path
-    prefix = str(p1)
-    metadata = Path(prefix + "_metadata.xml")
-    payload = Path(prefix + "_payload.xml")
+    # Case 3: prefix path or id search
+    metadata = Path(str(p1) + "_metadata.xml")
+    payload = Path(str(p1) + "_payload.xml")
+    if metadata.exists() and payload.exists():
+        return metadata, payload
+
+    search_root = determine_search_root()
+    metadata_match = find_record_by_identifier(search_root, str(p1))
+    if metadata_match is not None:
+        payload_guess = metadata_match.with_name(metadata_match.name.replace("_metadata.xml", "_payload.xml"))
+        return metadata_match, payload_guess
+
     return metadata, payload
 
 
@@ -177,26 +227,16 @@ def print_block(title: str):
     print("=" * 60)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Read and verify a JALoP record.")
-    parser.add_argument("input1", help="Metadata file path, or record prefix")
-    parser.add_argument("input2", nargs="?", help="Optional payload file path")
-    parser.add_argument(
-        "--public-key",
-        default="public.pem",
-        help="Path to RSA public key PEM file (default: public.pem)"
-    )
-    args = parser.parse_args()
-
-    metadata_path, payload_path = resolve_paths(args.input1, args.input2)
+def process_record(identifier: str, public_key_path: Path):
+    metadata_path, payload_path = resolve_paths(identifier, None)
 
     if not metadata_path.exists():
         print(f"ERROR: metadata file not found: {metadata_path}")
-        sys.exit(1)
+        return
 
     if not payload_path.exists():
         print(f"ERROR: payload file not found: {payload_path}")
-        sys.exit(1)
+        return
 
     metadata_bytes, metadata_root = parse_xml_file(metadata_path)
     payload_bytes, payload_root = parse_xml_file(payload_path)
@@ -249,7 +289,7 @@ def main():
         metadata_root,
         ns,
         payload_bytes,
-        Path(args.public_key)
+        public_key_path
     )
     if sig_ok is None:
         print(f"Signature Status        : SKIPPED ({sig_msg})")
@@ -260,6 +300,37 @@ def main():
     print_block("FINAL RESULT")
     final_ok = ok_hash and (ok_digest in (True, None)) and (sig_ok in (True, None))
     print("Record Verification     :", "PASS" if final_ok else "FAIL")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read and verify JALoP records interactively.")
+    parser.add_argument(
+        "--public-key",
+        default="public.pem",
+        help="Path to RSA public key PEM file (default: public.pem)"
+    )
+    args = parser.parse_args()
+    public_key_path = Path(args.public_key)
+
+    print("JALoP reader interactive mode. Enter a record ID or prefix to inspect.")
+    print("Type 'q' or 'quit' to exit.")
+
+    while True:
+        try:
+            user_input = input("Enter record id or prefix: ").strip()
+        except EOFError:
+            print()
+            break
+
+        if not user_input or user_input.lower() in {"q", "quit", "exit"}:
+            break
+
+        try:
+            process_record(user_input, public_key_path)
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+
+        print()
 
 
 if __name__ == "__main__":
